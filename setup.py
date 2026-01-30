@@ -13,7 +13,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="enumageddon",
-    version="1.0.3",
+    version="1.0.4",
     author="Not-4O4",
     author_email="security@example.com",
     description="A powerful multi-threaded web fuzzer and OSINT tool for discovering endpoints and cloud services",

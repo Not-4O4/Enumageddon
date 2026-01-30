@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "enumageddon"
-version = "1.0.3"
+version = "1.0.4"
 description = "A powerful multi-threaded web fuzzer and OSINT tool for discovering endpoints and cloud services"
 readme = "README.md"
 requires-python = ">=3.7"

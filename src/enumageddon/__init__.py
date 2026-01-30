@@ -312,7 +312,7 @@ KEYWORD_MUTATIONS = [
     'test-{keyword}',
 ]
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 __author__ = "Not-4O4"
 
 # This ensures enumageddon can be imported and used as a module

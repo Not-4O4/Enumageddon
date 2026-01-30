@@ -317,10 +317,11 @@ class Fuzzer:
     
     def __init__(self, target_url=None, wordlist=None, threads=20, timeout=None, rate_limit=0, extensions=None, 
                  filter_codes=None, method="GET", headers=None, output=None, aws=False, gcp=False, azure=False, 
-                 keyword=None, cloud_enum_mode=False, user_agent=None, follow_redirects=False, use_colors=True, verbosity=0):
+                 keyword=None, cloud_enum_mode=False, user_agent=None, follow_redirects=False, use_colors=True, verbosity=0, wildcard_domain=None):
         self.target_url = target_url
         self.wordlist_file = wordlist
         self.use_builtin = wordlist is None
+        self.wildcard_domain = wildcard_domain
         self.aws = aws
         self.gcp = gcp
         self.verbosity = verbosity
@@ -339,9 +340,9 @@ class Fuzzer:
         self.output_file = output
         self.use_colors = use_colors
         
-        # Ensure FUZZ placeholder exists (unless cloud mode)
+        # Ensure FUZZ or * placeholder exists (unless cloud mode or wildcard mode)
         is_cloud = aws or gcp or azure
-        if not is_cloud and 'FUZZ' not in self.target_url:
+        if not is_cloud and not wildcard_domain and 'FUZZ' not in self.target_url and '*' not in self.target_url:
             self.target_url += '/FUZZ'
         
         self.results = []
@@ -486,9 +487,52 @@ class Fuzzer:
         
         return endpoints
     
+    def fuzz_wildcard_domain(self, subdomain):
+        """Test a wildcard domain"""
+        # Construct domain with subdomain
+        domain = f"{subdomain}.{self.wildcard_domain}"
+        
+        if self.verbosity >= 2:
+            print(f"[DEBUG] Testing domain: {domain}")
+        
+        # Test as HTTPS and HTTP
+        urls_to_test = [f"https://{domain}", f"http://{domain}"]
+        
+        for test_url in urls_to_test:
+            try:
+                response = self.session.head(test_url, timeout=self.timeout, allow_redirects=self.follow_redirects)
+                
+                with self.lock:
+                    self.total_checked += 1
+                    
+                    # Check if status code is not filtered
+                    if response.status_code not in self.filter_codes:
+                        self.valid_found += 1
+                        result = f"[{colors.green(str(response.status_code))}] {test_url} ({response.headers.get('Server', 'Unknown')})"
+                        print(result)
+                        if self.output_file:
+                            with open(self.output_file, 'a') as f:
+                                f.write(result.replace('\033[92m', '').replace('\033[0m', '') + '\n')
+                        self.results.append({'url': test_url, 'status': response.status_code})
+                        
+                if self.rate_limit > 0:
+                    time.sleep(self.rate_limit)
+                    
+            except (requests.Timeout, requests.ConnectionError):
+                with self.lock:
+                    self.total_checked += 1
+                if self.verbosity >= 2:
+                    print(f"[DEBUG] Failed to connect: {test_url}")
+            except Exception as e:
+                with self.lock:
+                    self.total_checked += 1
+                if self.verbosity >= 2:
+                    print(f"[DEBUG] Error testing {test_url}: {str(e)}")
+    
     def fuzz(self, word):
         """Test a single word/path"""
-        url = self.target_url.replace('FUZZ', word)
+        # Support both FUZZ and * as placeholders
+        url = self.target_url.replace('FUZZ', word).replace('*', word)
         
         if self.verbosity >= 2:
             print(f"[DEBUG] Testing path: {word}")
@@ -575,8 +619,75 @@ class Fuzzer:
             self.fuzz(word)
             queue.task_done()
     
+    def wildcard_worker(self, queue):
+        """Worker thread for wildcard domain fuzzing"""
+        while True:
+            word = queue.get()
+            if word is None:
+                break
+            self.fuzz_wildcard_domain(word)
+            queue.task_done()
+    
+    def run_wildcard_domain_fuzzing(self):
+        """Execute wildcard domain fuzzing"""
+        print(f"\nMode: Wildcard Domain Fuzzing")
+        print(f"Domain: {self.wildcard_domain}")
+        print(f"Wordlist: built-in" if self.use_builtin else f"Wordlist: {self.wordlist_file}")
+        print(f"Threads: {self.threads_count}")
+        
+        if self.verbosity >= 1:
+            print(f"[*] Timeout: {self.timeout or 'default'} seconds")
+            if self.rate_limit > 0:
+                print(f"[*] Rate limit: {1.0/self.rate_limit:.2f} req/sec")
+        
+        print(f"\nStarting wildcard enumeration...\n")
+        
+        # Create queue and worker threads
+        queue = Queue()
+        threads = []
+        
+        for _ in range(self.threads_count):
+            t = Thread(target=self.wildcard_worker, args=(queue,))
+            t.start()
+            threads.append(t)
+        
+        # Load wordlist
+        words = self.load_wordlist()
+        print(f"Subdomains to test: {len(words)}")
+        
+        self.total_checked = 0
+        self.valid_found = 0
+        self.results = []
+        
+        # Add words to queue
+        for word in words:
+            queue.put(word)
+        
+        # Wait for queue to be processed
+        queue.join()
+        
+        # Stop workers
+        for _ in range(self.threads_count):
+            queue.put(None)
+        
+        for t in threads:
+            t.join()
+        
+        # Print summary
+        print(f"\n{'='*50}")
+        print(f"Total tested: {self.total_checked}")
+        print(f"Valid found: {self.valid_found}")
+        
+        if self.output_file:
+            print(f"Results saved to: {self.output_file}")
+    
     def run(self):
         """Execute the fuzzing"""
+        # Check if wildcard domain mode
+        if self.wildcard_domain:
+            self.run_wildcard_domain_fuzzing()
+            return
+        
         # Check if cloud_enum keyword mode
         if self.cloud_enum_mode and self.keyword:
             self.run_cloud_enum_mode()
@@ -921,9 +1032,11 @@ def main():
     
     # Required arguments
     parser.add_argument('-u', '--url', required=False, default=None,
-                        help='Target URL with FUZZ placeholder (e.g., https://target.com/FUZZ or https://api.target.com/v1/FUZZ)')
+                        help='Target URL with FUZZ or * placeholder (e.g., https://target.com/FUZZ or https://api.target.com/v1/* or https://target.com/*/config)')
     parser.add_argument('-w', '--wordlist', required=False, default=None,
                         help='Path to wordlist file (optional: uses built-in wordlist if not specified)')
+    parser.add_argument('-wc', '--wildcard-domain', required=False, default=None,
+                        help='Wildcard domain fuzzing (e.g., example.com to enumerate api.example.com, www.example.com, etc.)')
     
     # Core optional arguments
     parser.add_argument('-t', '--threads', type=int, default=20, 
@@ -975,7 +1088,7 @@ def main():
     print_banner()
     
     # Interactive mode if no URL and no keyword provided
-    if not args.url and not args.keyword:
+    if not args.url and not args.keyword and not args.wildcard_domain:
         help_text = """
 ========== ENUMAGEDDON - INTERACTIVE MODE ==========
 
@@ -1094,10 +1207,11 @@ Type 'help' for full options, or enter a command to continue.
             args.follow_redirects = parsed.follow_redirects
             args.no_color = parsed.no_color
             args.verbose = parsed.verbose
+            args.wildcard_domain = parsed.wildcard_domain
             
             # Validate the parsed arguments
-            if not args.url and not args.keyword:
-                print("[!] Error: Command must contain -u (URL fuzzing) or -k (cloud enumeration)")
+            if not args.url and not args.keyword and not args.wildcard_domain:
+                print("[!] Error: Command must contain -u (URL fuzzing), -k (cloud enumeration), or -wc (wildcard domain fuzzing)")
                 print("[*] Type 'help' for available options\n")
                 continue
             
@@ -1150,7 +1264,8 @@ Type 'help' for full options, or enter a command to continue.
                 user_agent=args.user_agent,
                 follow_redirects=args.follow_redirects,
                 use_colors=colors.enabled,
-                verbosity=args.verbose
+                verbosity=args.verbose,
+                wildcard_domain=args.wildcard_domain
             )
             fuzzer.run()
             print("\n[*] Scan completed. Returning to interactive mode...\n")
@@ -1160,7 +1275,7 @@ Type 'help' for full options, or enter a command to continue.
             print(f"[!] Error: {e}\n")
         
         # Loop back to interactive mode
-        if not args.url or (not args.aws and not args.gcp and not args.azure and not args.keyword):
+        if not args.url or (not args.aws and not args.gcp and not args.azure and not args.keyword and not args.wildcard_domain):
             # If started in interactive mode, ask for next command
             help_text = """
 Enter your next command or 'help' for options:
@@ -1238,6 +1353,7 @@ Enter your next command or 'help' for options:
             args.follow_redirects = parsed.follow_redirects
             args.no_color = parsed.no_color
             args.verbose = parsed.verbose
+            args.wildcard_domain = parsed.wildcard_domain
         else:
             # If started with command-line arguments, exit after one scan
             break
